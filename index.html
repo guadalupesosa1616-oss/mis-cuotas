@@ -138,6 +138,8 @@ nav.tabs button[aria-current="page"]{color:var(--accent)}
 
 <div id="sheet" class="sheet" hidden></div>
 
+<script src="config.js"></script>
+<script src="supabase.js"></script>
 <script>
 (function(){
 "use strict";
@@ -180,13 +182,17 @@ const job=()=>Object.assign(JOB_DEFAULT(),S.job||{});
 function saveJob(){
   const snap=JSON.parse(JSON.stringify(job()));
   if(S.mode==='db')jobChain=jobChain.then(()=>jobRef.set(snap)).catch(()=>{});
-  else{try{localStorage.setItem(LS+'-job',JSON.stringify(snap));}catch(e){}}
+  else{try{localStorage.setItem(LS+'-job',JSON.stringify(snap));}catch(e){}schedulePush();}
 }
 const LS='mis-cuotas-v1';
+const CONF=window.MIS_CUOTAS_CONFIG||{};
+const CLOUD=!!(CONF.url&&CONF.key&&window.supabase);
+let sb=null,user=null,pushTimer=null,retryTimer=null,pushing=false;const sync={state:'',at:null};
 const cfg=()=>S.cfg||BLANK;
 
 function lsLoad(){try{const r=JSON.parse(localStorage.getItem(LS)||'null');if(r){S.cfg=r.cfg||null;S.movs=r.movs||[];S.sim=r.sim||[];}}catch(e){}}
-function lsSave(){try{localStorage.setItem(LS,JSON.stringify({cfg:S.cfg,movs:S.movs,sim:S.sim}));}catch(e){}}
+function writeLocal(){try{localStorage.setItem(LS,JSON.stringify({cfg:S.cfg,movs:S.movs,sim:S.sim}));localStorage.setItem(LS+'-job',JSON.stringify(S.job));}catch(e){}}
+function lsSave(){writeLocal();schedulePush();}
 function saveSim(){
   const snap=JSON.parse(JSON.stringify(S.sim));
   if(S.mode==='db')simChain=simChain.then(()=>simRef.set({ajustes:snap})).catch(()=>{});
@@ -275,7 +281,8 @@ function monthHeader(){
   <button class="iconbtn" data-act="next" aria-label="Mes siguiente">›</button></div>`;
 }
 function banner(){
-  if(!S.cfg)return `<div class="banner">Todavía no hay datos en este celular. Si ya usabas Mis Cuotas, importá tu archivo en <b>Plan › Mis datos</b>. Si no, empezá cargando tu sueldo en <b>Plan › Supuestos</b>.<div style="margin-top:8px"><button class="btn small" data-act="goimport">Importar mis datos</button></div></div>`;
+  if(sync.state==='err')return `<div class="banner" style="background:var(--bad-soft)">No se pudo guardar en la nube. Lo que cargues queda en el celu y se sube solo cuando vuelva la conexión.</div>`;
+  if(!S.cfg)return `<div class="banner">Todavía no hay datos guardados. Si ya usabas Mis Cuotas, importá tu archivo en <b>Plan › Mis datos</b> (es una sola vez). Si no, empezá cargando tu sueldo en <b>Plan › Supuestos</b>.<div style="margin-top:8px"><button class="btn small" data-act="goimport">Importar mis datos</button></div></div>`;
   return '';
 }
 
@@ -465,12 +472,13 @@ function viewPlan(){
   <section class="card section" id="supuestos">${supuestosForm()}</section>
   <section class="card section" id="misdatos">
     <h2>Mis datos</h2>
-    <div class="hint">Tus datos se guardan solo en este celular, dentro de la app. No se suben a ningún lado. Bajate una copia cada tanto: si borrás los datos del navegador o cambiás de celular, con esa copia los recuperás.</div>
+    ${CLOUD?`<div class="hint">Tus datos se guardan solos en tu cuenta (${esc(user&&user.email||'')}) cada vez que cambiás algo. Los ves igual en el celu y en la compu.</div><div id="sync-line" class="small">${syncText()}</div>`:`<div class="hint">Tus datos se guardan solo en este celular. Bajate una copia cada tanto.</div>`}
     <button class="btn" data-act="exportjson">Guardar copia (archivo de datos)</button>
     <button class="btn" data-act="export">Descargar Excel</button>
     <label class="btn" style="text-align:center">Importar copia<input id="imp-file" type="file" accept=".json,application/json" hidden></label>
     <div id="imp-confirm" hidden class="alert"></div>
     <div id="x-msg" class="msg full" aria-live="polite"></div>
+    ${CLOUD?'<button class="btn small" data-act="logout">Cerrar sesión</button>':''}
   </section>`;
 }
 /* ---------- simulador de trabajo ---------- */
@@ -697,6 +705,8 @@ function closeSheet(){const sh=document.getElementById('sheet');sh.hidden=true;s
 
 /* ---------- render ---------- */
 function render(){
+  const navEl=document.querySelector('nav.tabs');if(navEl)navEl.hidden=CLOUD&&S.auth!=='in';
+  if(CLOUD&&S.auth!=='in'){if(!document.getElementById('loginform')||S.auth!=='out')app.innerHTML=loginView();return;}
   document.querySelectorAll('nav.tabs button').forEach(b=>b.setAttribute('aria-current',b.dataset.tab===S.tab?'page':'false'));
   if(!S.loaded){app.innerHTML='<div class="empty">Cargando tus datos…</div>';return;}
   // no pisar formularios mientras se escribe
@@ -873,14 +883,101 @@ function saveFile(filename,data,type){
   const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=filename;document.body.appendChild(a);a.click();
   setTimeout(()=>{URL.revokeObjectURL(a.href);a.remove();},1500);
 }
-function init(){
+/* ---------- nube ---------- */
+function loginView(){
+  if(S.auth==='checking'||!S.auth)return '<div class="empty">Cargando…</div>';
+  return `<div style="padding-top:8vh" class="section">
+    <div><div class="eyebrow">Mis Cuotas</div><h1>Entrá con tu cuenta</h1><div class="hint" style="margin-top:6px">Tus datos se guardan en la nube y no se pierden aunque reinicies o cambies el celu.</div></div>
+    <section class="card section">
+      <form id="loginform" class="form" novalidate>
+        <label class="f full">Mail<input id="lg-mail" type="email" autocomplete="username" inputmode="email"></label>
+        <label class="f full">Contraseña<input id="lg-pass" type="password" autocomplete="current-password"></label>
+        <button class="btn primary full" type="submit" data-mode="in">Entrar</button>
+        <button class="btn full" type="button" data-act="signup">Crear mi usuario</button>
+        <div id="lg-msg" class="msg full" aria-live="polite"></div>
+      </form>
+    </section></div>`;
+}
+function syncText(){
+  if(sync.state==='pend')return '<span class="muted">Guardando…</span>';
+  if(sync.state==='err')return '<span class="neg">No se pudo guardar. Se reintenta solo.</span>';
+  if(sync.state==='ok'&&sync.at)return '<span class="pos">✓ Guardado</span> <span class="muted">'+sync.at.toLocaleTimeString('es-AR',{hour:'2-digit',minute:'2-digit'})+'</span>';
+  return '';
+}
+function setSync(st,err){const prev=sync.state;sync.state=st;if(st==='ok')sync.at=new Date();const el=document.getElementById('sync-line');if(el)el.innerHTML=syncText();if((prev==='err')!==(st==='err'))render();}
+function markDirty(){try{localStorage.setItem(LS+'-dirty','1');}catch(e){}}
+function isDirty(){try{return localStorage.getItem(LS+'-dirty')==='1';}catch(e){return false;}}
+function schedulePush(){if(!CLOUD||!user)return;markDirty();clearTimeout(pushTimer);pushTimer=setTimeout(push,700);setSync('pend');}
+async function push(){
+  if(!user)return;if(pushing){schedulePush();return;}pushing=true;
+  try{
+    const {error}=await sb.from('mis_cuotas').upsert({user_id:user.id,data:{cfg:S.cfg,movs:S.movs,sim:S.sim,job:S.job},updated_at:new Date().toISOString()});
+    if(error)throw error;
+    try{localStorage.removeItem(LS+'-dirty');}catch(e){}
+    setSync('ok');
+  }catch(e){setSync('err');clearTimeout(retryTimer);retryTimer=setTimeout(()=>{if(isDirty())push();},15000);}
+  finally{pushing=false;}
+}
+async function pull(){
+  const {data,error}=await sb.from('mis_cuotas').select('data,updated_at').eq('user_id',user.id).maybeSingle();
+  if(error)throw error;return data;
+}
+function applyData(d){S.cfg=d.cfg||null;normCfg();S.movs=(d.movs||[]).map((m,i)=>Object.assign({id:m.id||('l'+Date.now()+'_'+i)},m));S.sim=d.sim||[];S.job=d.job||null;writeLocal();draft=null;}
+async function afterLogin(){
+  S.auth='in';S.loaded=true;render();
+  try{
+    const row=await pull();
+    if(isDirty()&&S.cfg)await push();
+    else if(row&&row.data&&row.data.cfg){applyData(row.data);setSync('ok');render();}
+    else if(S.cfg)await push();
+    else setSync('ok');
+  }catch(e){setSync('err');}
+}
+async function refresh(){
+  if(!user||isDirty()||pushing)return;
+  try{const row=await pull();if(row&&row.data&&row.data.cfg){applyData(row.data);render();}}catch(e){}
+}
+function authMsg(e){
+  const m=(e&&e.message||'').toLowerCase();
+  if(m.includes('invalid login'))return 'Mail o contraseña incorrectos.';
+  if(m.includes('not confirmed'))return 'Falta confirmar tu mail: abrí el correo de Supabase y tocá el link. Después tocá Entrar.';
+  if(m.includes('signups not allowed')||m.includes('signup is disabled'))return 'No se pueden crear usuarios nuevos. Si ya tenés el tuyo, tocá Entrar.';
+  if(m.includes('already registered'))return 'Ese mail ya tiene usuario. Tocá Entrar.';
+  if(m.includes('password')&&m.includes('6'))return 'La contraseña tiene que tener al menos 6 caracteres.';
+  if(m.includes('fetch')||m.includes('network'))return 'Sin conexión. Probá de nuevo cuando tengas internet.';
+  return 'No se pudo: '+(e&&e.message||'error');
+}
+async function doAuth(mode){
+  const mail=(document.getElementById('lg-mail').value||'').trim(),pass=document.getElementById('lg-pass').value||'',msg=document.getElementById('lg-msg');
+  if(!mail||!pass){msg.className='msg full err';msg.textContent='Completá mail y contraseña.';return;}
+  msg.className='msg full';msg.textContent=mode==='up'?'Creando usuario…':'Entrando…';
+  try{
+    const r=mode==='up'?await sb.auth.signUp({email:mail,password:pass}):await sb.auth.signInWithPassword({email:mail,password:pass});
+    if(r.error)throw r.error;
+    if(r.data&&r.data.session){user=r.data.session.user;await afterLogin();}
+    else{msg.className='msg full okm';msg.textContent='Listo. Te mandamos un mail para confirmar la cuenta: abrilo, tocá el link y después volvé acá y tocá Entrar.';}
+  }catch(e){msg.className='msg full err';msg.textContent=authMsg(e);}
+}
+document.addEventListener('submit',e=>{if(e.target.id==='loginform'){e.preventDefault();doAuth('in');}},true);
+document.addEventListener('click',e=>{const t=e.target.closest('[data-act]');if(!t)return;
+  if(t.dataset.act==='signup'){doAuth('up');}
+  else if(t.dataset.act==='logout'&&sb){sb.auth.signOut().finally(()=>{user=null;S.auth='out';S.cfg=null;S.movs=[];S.sim=[];S.job=null;try{[LS,LS+'-job',LS+'-dirty'].forEach(k=>localStorage.removeItem(k));}catch(err){}render();});}
+});
+document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible')refresh();});
+addEventListener('online',()=>{if(isDirty())push();});
+
+async function init(){
   S.mode='local';lsLoad();normCfg();
   S.movs.forEach((m,i)=>{if(!m.id)m.id='l'+Date.now()+'_'+i;});
   try{S.job=JSON.parse(localStorage.getItem(LS+'-job')||'null');}catch(e){}
   S.dl={save:async({filename,data})=>saveFile(filename,data,'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')};
-  S.loaded=true;render();
   try{navigator.storage&&navigator.storage.persist&&navigator.storage.persist();}catch(e){}
   if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+  if(!CLOUD){S.loaded=true;render();return;}
+  sb=window.supabase.createClient(CONF.url,CONF.key,{auth:{persistSession:true,autoRefreshToken:true,storageKey:'mis-cuotas-auth'}});
+  S.auth='checking';render();
+  try{const {data}=await sb.auth.getSession();if(data&&data.session){user=data.session.user;await afterLogin();return;}}catch(e){}
+  S.auth='out';render();
 }
 let pendingImport=null;
 document.addEventListener('change',e=>{
